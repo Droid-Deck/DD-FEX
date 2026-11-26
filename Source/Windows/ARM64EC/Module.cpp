@@ -805,6 +805,50 @@ bool ResetToConsistentStateImpl(const ThreadCPUArea CPUArea, EXCEPTION_RECORD* E
   }
 
   if (IsEmulatorStackAddress(CPUArea, reinterpret_cast<uint64_t>(__builtin_frame_address(0)))) {
+    // Arxan integrity guards in high-ASLR PE64 executables (e.g. Forza Horizon 4) bias a valid
+    // continuation RIP by the image's preferred ImageBase (0x140000000) when their self-hash sees
+    // runtime SMC/tamper bytes, causing an instruction-fetch fault on an unmapped address.
+    // If subtracting 0x140000000 lands inside committed executable MEM_IMAGE code of a PE64 .exe,
+    // strip the bias and resume JIT execution.
+    auto& Fault = Thread->CurrentFrame->SynchronousFaultData;
+    if (Fault.FaultToTopAndGeneratedException && Fault.Signal == FEXCore::Core::FAULT_SIGSEGV &&
+        Fault.TrapNo == FEXCore::X86State::X86_TRAPNO_PF && (Fault.err_code & FEXCore::X86State::X86_PF_INSTR)) {
+      static constexpr uint64_t PreferredExeBase = 0x140000000ULL;
+      const uint64_t Rip = CTX->RestoreRIPFromHostPC(Thread, NativeContext->Pc);
+      if (Rip > PreferredExeBase) {
+        const uint64_t Cand = Rip - PreferredExeBase;
+        MEMORY_BASIC_INFORMATION Mbi {};
+        if (NtQueryVirtualMemory(NtCurrentProcess(), reinterpret_cast<void*>(Cand), MemoryBasicInformation, &Mbi, sizeof(Mbi), nullptr) == 0 &&
+            Mbi.State == MEM_COMMIT && Mbi.Type == MEM_IMAGE &&
+            (Mbi.Protect & (PAGE_EXECUTE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY))) {
+          // Wine's PE loader updates OptionalHeader.ImageBase in memory to the relocated base,
+          // so verify that Cand is inside a PE64 executable image (.exe, not DLL) past the header page.
+          IMAGE_DOS_HEADER Dos {};
+          IMAGE_NT_HEADERS64 Nt {};
+          SIZE_T ReadBytes = 0;
+          const auto ImgBase = reinterpret_cast<uint64_t>(Mbi.AllocationBase);
+          if (Cand >= ImgBase + 0x1000ULL &&
+              NtReadVirtualMemory(NtCurrentProcess(), reinterpret_cast<void*>(ImgBase), &Dos, sizeof(Dos), &ReadBytes) == 0 &&
+              ReadBytes == sizeof(Dos) && Dos.e_magic == IMAGE_DOS_SIGNATURE && Dos.e_lfanew >= sizeof(IMAGE_DOS_HEADER) &&
+              Dos.e_lfanew <= 0x1000 &&
+              NtReadVirtualMemory(NtCurrentProcess(), reinterpret_cast<void*>(ImgBase + static_cast<uint32_t>(Dos.e_lfanew)),
+                                  &Nt, sizeof(Nt), &ReadBytes) == 0 &&
+              ReadBytes == sizeof(Nt) && Nt.Signature == IMAGE_NT_SIGNATURE &&
+              Nt.OptionalHeader.Magic == IMAGE_NT_OPTIONAL_HDR64_MAGIC &&
+              (Nt.FileHeader.Characteristics & IMAGE_FILE_DLL) == 0) {
+            Exception::ReconstructThreadState(Thread, *NativeContext);
+            Fault.FaultToTopAndGeneratedException = false;
+            Thread->CurrentFrame->State.rip = Cand;
+            NativeContext->Pc = CPUArea.DispatcherLoopTopEnterECFillSRA();
+            NativeContext->Sp = CPUArea.EmulatorStackBase();
+            NativeContext->X11 = 0;
+            NativeContext->X17 = reinterpret_cast<uint64_t>(CPUArea.Area);
+            LogMan::Msg::DFmt("Redirected biased image NoExec RIP: {:X} -> {:X} (base {:X})", Rip, Cand, ImgBase);
+            return true;
+          }
+        }
+      }
+    }
     Exception::RethrowGuestException(*Exception, *NativeContext);
     LogMan::Msg::DFmt("Rethrowing onto guest stack: {:X}", NativeContext->Sp);
     return true;
